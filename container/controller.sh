@@ -11,8 +11,14 @@ set -eu
 : "${SCAN_INTERVAL:=5}"
 : "${GLOBAL_EXCLUDE_CIDRS:=}"
 : "${SELF_CONTAINER_ID:=}"
+: "${OVPN_DNS_SERVER:=}"
+: "${OVPN_DNS_DOMAINS:=}"
+: "${OVPN_DNS_LISTEN:=127.0.0.53}"
+: "${OVPN_DNS_PROXY_UID:=53453}"
+: "${DNS_STATE_DIR:=/run/ovpn-egress/dns}"
 
 export DOCKER_HOST
+export OVPN_DNS_LISTEN
 
 log() {
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
@@ -146,6 +152,98 @@ nsenter_net() {
   nsenter --net="$HOST_PROC/$pid/ns/net" -- "$@"
 }
 
+split_dns_enabled() {
+  [ -n "$OVPN_DNS_SERVER" ] && [ -n "$OVPN_DNS_DOMAINS" ]
+}
+
+dns_proxy_pid_file() {
+  printf '%s/%s.pid\n' "$DNS_STATE_DIR" "$1"
+}
+
+dns_proxy_running() {
+  pid_file="$(dns_proxy_pid_file "$1")"
+  [ -r "$pid_file" ] || return 1
+  dns_pid="$(cat "$pid_file" 2>/dev/null || true)"
+  case "$dns_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$dns_pid" 2>/dev/null
+}
+
+target_iptables_nat_ensure() {
+  pid="$1"
+  chain="$2"
+  shift 2
+
+  nsenter_net "$pid" iptables -w -t nat -C "$chain" "$@" 2>/dev/null ||
+    nsenter_net "$pid" iptables -w -t nat -A "$chain" "$@"
+}
+
+install_dns_redirects() {
+  pid="$1"
+
+  target_iptables_nat_ensure "$pid" OUTPUT \
+    -p udp --dport 53 \
+    -m owner ! --uid-owner "$OVPN_DNS_PROXY_UID" \
+    -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
+
+  target_iptables_nat_ensure "$pid" OUTPUT \
+    -p tcp --dport 53 \
+    -m owner ! --uid-owner "$OVPN_DNS_PROXY_UID" \
+    -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
+}
+
+ensure_split_dns() {
+  id="$1"
+  pid="$2"
+
+  split_dns_enabled || return 0
+  mkdir -p "$DNS_STATE_DIR"
+
+  if ! dns_proxy_running "$id"; then
+    pid_file="$(dns_proxy_pid_file "$id")"
+    log_file="$DNS_STATE_DIR/$id.log"
+    rm -f "$pid_file"
+    nsenter_net "$pid" /usr/local/bin/ovpn-dns-proxy "$OVPN_DNS_SERVER" "$OVPN_DNS_DOMAINS" >"$log_file" 2>&1 &
+    dns_pid="$!"
+    printf '%s\n' "$dns_pid" >"$pid_file"
+    sleep 1
+
+    if ! kill -0 "$dns_pid" 2>/dev/null; then
+      log "failed to start split DNS for $id: $(tail -n 1 "$log_file" 2>/dev/null || true)"
+      rm -f "$pid_file"
+      return 1
+    fi
+
+    log "started split DNS for $id: domains=$OVPN_DNS_DOMAINS server=$OVPN_DNS_SERVER listen=$OVPN_DNS_LISTEN"
+  fi
+
+  install_dns_redirects "$pid"
+}
+
+cleanup_split_dns() {
+  active_ids="$1"
+
+  split_dns_enabled || return 0
+  [ -d "$DNS_STATE_DIR" ] || return 0
+
+  for pid_file in "$DNS_STATE_DIR"/*.pid; do
+    [ -e "$pid_file" ] || continue
+    id="${pid_file##*/}"
+    id="${id%.pid}"
+
+    printf '%s\n' "$active_ids" | grep -qx "$id" && continue
+
+    dns_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    case "$dns_pid" in
+      ''|*[!0-9]*) ;;
+      *) kill "$dns_pid" 2>/dev/null || true ;;
+    esac
+    rm -f "$pid_file" "$DNS_STATE_DIR/$id.log"
+    log "stopped split DNS for stale container $id"
+  done
+}
+
 target_iface_for_ip() {
   pid="$1"
   ip_addr="$2"
@@ -218,7 +316,10 @@ route_container() {
   }
 
   current_default="$(nsenter_net "$pid" ip route show default 2>/dev/null | head -n 1 || true)"
-  printf '%s\n' "$current_default" | grep -q "via $gateway_ip dev $iface" && return 0
+  if printf '%s\n' "$current_default" | grep -q "via $gateway_ip dev $iface"; then
+    ensure_split_dns "$id" "$pid"
+    return 0
+  fi
 
   old_gw="$(printf '%s\n' "$current_default" | awk '{ for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit } }')"
   old_dev="$(printf '%s\n' "$current_default" | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
@@ -227,6 +328,7 @@ route_container() {
 
   apply_excludes "$pid" "$old_gw" "$old_dev" "$excludes"
   nsenter_net "$pid" ip route replace default via "$gateway_ip" dev "$iface"
+  ensure_split_dns "$id" "$pid"
   log "routed $id on $network default via $gateway_ip dev $iface"
 }
 
@@ -237,13 +339,23 @@ need_cmd ip
 need_cmd jq
 need_cmd nsenter
 
+if split_dns_enabled; then
+  need_cmd dnsmasq
+  need_cmd iptables
+  need_cmd ovpn-dns-proxy
+fi
+
 [ -S /var/run/docker.sock ] || log "warning: /var/run/docker.sock is not a unix socket inside the controller"
 [ -d "$HOST_PROC" ] || {
   log "error: host proc mount is missing: $HOST_PROC"
   exit 1
 }
 
-log "controller started: label=$TARGET_LABEL gateway_mode=$GATEWAY_IP_MODE gateway=$GATEWAY_DNS"
+if split_dns_enabled; then
+  log "controller started: label=$TARGET_LABEL gateway_mode=$GATEWAY_IP_MODE gateway=$GATEWAY_DNS split_dns=$OVPN_DNS_DOMAINS->$OVPN_DNS_SERVER"
+else
+  log "controller started: label=$TARGET_LABEL gateway_mode=$GATEWAY_IP_MODE gateway=$GATEWAY_DNS"
+fi
 
 while :; do
   allowed_network_ids="$(own_network_ids || true)"
@@ -260,11 +372,13 @@ while :; do
     continue
   fi
 
-  docker ps -q --filter "label=$TARGET_LABEL" 2>/dev/null |
+  target_ids="$(docker ps -q --filter "label=$TARGET_LABEL" 2>/dev/null || true)"
+  printf '%s\n' "$target_ids" |
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       route_container "$id" "$gateway_ip" "$allowed_network_ids" || log "failed to route $id"
     done
 
+  cleanup_split_dns "$target_ids"
   sleep "$SCAN_INTERVAL"
 done
