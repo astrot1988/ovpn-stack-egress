@@ -1,16 +1,30 @@
 #!/bin/sh
 set -eu
 
+: "${OPENVPN_MANAGEMENT_SOCKET:=/run/ovpn-egress/openvpn.sock}"
+: "${VPN_INTERFACE:=tun0}"
+
+gateway_healthy() {
+  ip link show "$VPN_INTERFACE" >/dev/null 2>&1 && return 0
+
+  [ -S "$OPENVPN_MANAGEMENT_SOCKET" ] &&
+    pidof openvpn >/dev/null 2>&1
+}
+
+controller_healthy() {
+  docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+}
+
 case "${ROLE:-gateway-controller}" in
   gateway)
-    ip link show "${VPN_INTERFACE:-tun0}" >/dev/null 2>&1
+    gateway_healthy
     ;;
   controller)
-    docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+    controller_healthy
     ;;
   gateway-controller|combined)
-    ip link show "${VPN_INTERFACE:-tun0}" >/dev/null 2>&1
-    docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+    gateway_healthy
+    controller_healthy
     ;;
   *)
     exit 1
