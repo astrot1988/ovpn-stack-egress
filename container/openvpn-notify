@@ -3,6 +3,8 @@ set -eu
 
 : "${NOTIFY_URL:=}"
 : "${OPENVPN_NOTIFY_DIR:=/run/ovpn-egress}"
+: "${HOST_HOSTNAME_FILE:=}"
+: "${NOTIFY_HOSTNAME:=}"
 
 case "${0##*/}" in
   openvpn-notify-down) event="connection-down" ;;
@@ -19,13 +21,38 @@ command -v curl >/dev/null 2>&1 || {
   exit 0
 }
 
+notify_hostname() {
+  if [ -n "$NOTIFY_HOSTNAME" ]; then
+    printf '%s\n' "$NOTIFY_HOSTNAME"
+    return 0
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    docker_hostname="$(docker info --format '{{.Name}}' 2>/dev/null || true)"
+    if [ -n "$docker_hostname" ]; then
+      printf '%s\n' "$docker_hostname"
+      return 0
+    fi
+  fi
+
+  if [ -n "$HOST_HOSTNAME_FILE" ] && [ -r "$HOST_HOSTNAME_FILE" ]; then
+    file_hostname="$(awk 'NF { print; exit }' "$HOST_HOSTNAME_FILE" 2>/dev/null || true)"
+    if [ -n "$file_hostname" ]; then
+      printf '%s\n' "$file_hostname"
+      return 0
+    fi
+  fi
+
+  hostname 2>/dev/null || printf unknown
+}
+
 if [ -f "$stamp" ]; then
   last="$(cat "$stamp" 2>/dev/null || printf 0)"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
   [ "$((now - last))" -ge 60 ] || exit 0
 fi
 
-host="$(hostname 2>/dev/null || printf unknown)"
+host="$(notify_hostname)"
 time="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 case "$event" in
   credentials-required) message="OpenVPN credentials required on $host at $time" ;;
