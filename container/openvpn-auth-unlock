@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+
+: "${OPENVPN_MANAGEMENT_SOCKET:=/run/ovpn-egress/openvpn.sock}"
+: "${OPENVPN_KEY_LABEL:=Private Key}"
+export OPENVPN_MANAGEMENT_SOCKET OPENVPN_KEY_LABEL
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+[ -S "$OPENVPN_MANAGEMENT_SOCKET" ] || die "OpenVPN management socket not found: $OPENVPN_MANAGEMENT_SOCKET"
+command -v expect >/dev/null 2>&1 || die "required command missing: expect"
+command -v socat >/dev/null 2>&1 || die "required command missing: socat"
+
+printf "OpenVPN username: "
+IFS= read -r username
+printf "OpenVPN password: "
+stty -echo
+IFS= read -r password
+stty echo
+printf "\n"
+printf "Private key passphrase: "
+stty -echo
+IFS= read -r key_password
+stty echo
+printf "\n"
+
+export OPENVPN_UNLOCK_USERNAME="$username"
+export OPENVPN_UNLOCK_PASSWORD="$password"
+export OPENVPN_UNLOCK_KEY_PASSWORD="$key_password"
+
+expect <<'EXPECT'
+  set timeout 90
+  set socket $env(OPENVPN_MANAGEMENT_SOCKET)
+  set key_label $env(OPENVPN_KEY_LABEL)
+  set username $env(OPENVPN_UNLOCK_USERNAME)
+  set password $env(OPENVPN_UNLOCK_PASSWORD)
+  set key_password $env(OPENVPN_UNLOCK_KEY_PASSWORD)
+  set sent_password 0
+
+  proc q {value} {
+    regsub -all {([\\"])} $value {\\\1} value
+    return $value
+  }
+
+  spawn socat - UNIX-CONNECT:$socket
+  expect {
+    -re {INFO:OpenVPN Management Interface} {}
+    timeout {}
+  }
+
+  while {1} {
+    expect {
+      -re {>PASSWORD:Need '([^']+)' username/password} {
+        set label $expect_out(1,string)
+        send "username \"[q $label]\" \"[q $username]\"\r"
+        send "password \"[q $label]\" \"[q $password]\"\r"
+        set sent_password 1
+        set timeout 30
+        exp_continue
+      }
+      -re {>PASSWORD:Need '([^']+)' password} {
+        set label $expect_out(1,string)
+        if {$label == $key_label} {
+          send "password \"[q $label]\" \"[q $key_password]\"\r"
+        } else {
+          send "password \"[q $label]\" \"[q $password]\"\r"
+        }
+        set sent_password 1
+        set timeout 30
+        exp_continue
+      }
+      eof {
+        break
+      }
+      timeout {
+        if {$sent_password == 0} {
+          puts stderr "timeout waiting for OpenVPN password prompt"
+          exit 1
+        }
+        break
+      }
+    }
+  }
+
+  send "quit\r"
+  expect eof
+EXPECT

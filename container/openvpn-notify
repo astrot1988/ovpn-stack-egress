@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+: "${NOTIFY_URL:=}"
+: "${OPENVPN_NOTIFY_DIR:=/run/ovpn-egress}"
+
+case "${0##*/}" in
+  openvpn-notify-down) event="connection-down" ;;
+  *) event="${1:-event}" ;;
+esac
+
+mkdir -p "$OPENVPN_NOTIFY_DIR" 2>/dev/null || true
+stamp="$OPENVPN_NOTIFY_DIR/notify-${event}.stamp"
+now="$(date +%s)"
+
+[ -n "$NOTIFY_URL" ] || exit 0
+command -v curl >/dev/null 2>&1 || {
+  echo "warning: NOTIFY_URL is set but curl is missing" >&2
+  exit 0
+}
+
+if [ -f "$stamp" ]; then
+  last="$(cat "$stamp" 2>/dev/null || printf 0)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$((now - last))" -ge 60 ] || exit 0
+fi
+
+host="$(hostname 2>/dev/null || printf unknown)"
+time="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+case "$event" in
+  credentials-required) message="OpenVPN credentials required on $host at $time" ;;
+  connection-down) message="OpenVPN connection is down on $host at $time" ;;
+  *) message="OpenVPN event on $host at $time: $event" ;;
+esac
+
+echo "notify: $message" >&2
+printf '%s\n' "$now" >"$stamp" 2>/dev/null || true
+curl -fsS --max-time 10 --get --data-urlencode "text=$message" "$NOTIFY_URL" >/dev/null 2>&1 || true
