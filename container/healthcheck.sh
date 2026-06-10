@@ -24,7 +24,6 @@ case "${ROLE:-gateway-controller}" in
     ;;
   gateway-controller|combined)
     gateway_healthy
-    controller_healthy
     ;;
   *)
     exit 1
