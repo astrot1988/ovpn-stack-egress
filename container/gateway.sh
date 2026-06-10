@@ -145,7 +145,12 @@ configure_forwarding() {
   cidrs="$(egress_network_cidrs)"
   [ -n "$cidrs" ] || die "failed to detect egress network CIDRs"
 
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null || die "failed to enable net.ipv4.ip_forward"
+  ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  if [ "$ip_forward" != "1" ]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  fi
+  [ "$ip_forward" = "1" ] || die "net.ipv4.ip_forward is disabled; set service sysctls net.ipv4.ip_forward=1"
 
   for cidr in $cidrs; do
     iface="$(route_iface_for_cidr "$cidr")"

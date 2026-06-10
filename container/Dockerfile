@@ -31,5 +31,5 @@ RUN chmod 755 \
     /usr/local/sbin/openvpn-auth-unlock \
     && ln -sf /usr/local/sbin/openvpn-notify /usr/local/sbin/openvpn-notify-down
 
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/ovpn-entrypoint"]
+ENTRYPOINT ["/sbin/tini", "-s", "--", "/usr/local/bin/ovpn-entrypoint"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD /usr/local/bin/ovpn-healthcheck
