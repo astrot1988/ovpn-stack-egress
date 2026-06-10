@@ -14,7 +14,6 @@ set -eu
 : "${OVPN_DNS_SERVER:=}"
 : "${OVPN_DNS_DOMAINS:=}"
 : "${OVPN_DNS_LISTEN:=127.0.0.53}"
-: "${OVPN_DNS_PROXY_UID:=53453}"
 : "${DNS_STATE_DIR:=/run/ovpn-egress/dns}"
 
 export DOCKER_HOST
@@ -170,27 +169,97 @@ dns_proxy_running() {
   kill -0 "$dns_pid" 2>/dev/null
 }
 
-target_iptables_nat_ensure() {
+target_iptables_nat_delete() {
   pid="$1"
   chain="$2"
   shift 2
 
-  nsenter_net "$pid" iptables -w -t nat -C "$chain" "$@" 2>/dev/null ||
-    nsenter_net "$pid" iptables -w -t nat -A "$chain" "$@"
+  while nsenter_net "$pid" iptables -w -t nat -C "$chain" "$@" 2>/dev/null; do
+    nsenter_net "$pid" iptables -w -t nat -D "$chain" "$@" || return 1
+  done
 }
 
-install_dns_redirects() {
+remove_legacy_dns_redirects() {
   pid="$1"
 
-  target_iptables_nat_ensure "$pid" OUTPUT \
+  # Older builds redirected all DNS traffic with owner-based exclusions. That
+  # conflicts with Docker's embedded DNS and can loop dnsmasq queries.
+  target_iptables_nat_delete "$pid" OUTPUT \
     -p udp --dport 53 \
-    -m owner ! --uid-owner "$OVPN_DNS_PROXY_UID" \
     -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
 
-  target_iptables_nat_ensure "$pid" OUTPUT \
+  target_iptables_nat_delete "$pid" OUTPUT \
     -p tcp --dport 53 \
-    -m owner ! --uid-owner "$OVPN_DNS_PROXY_UID" \
     -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
+
+  target_iptables_nat_delete "$pid" OUTPUT \
+    -p udp --dport 53 \
+    -m owner ! --uid-owner 53453 \
+    -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
+
+  target_iptables_nat_delete "$pid" OUTPUT \
+    -p tcp --dport 53 \
+    -m owner ! --uid-owner 53453 \
+    -j DNAT --to-destination "$OVPN_DNS_LISTEN:53"
+}
+
+target_resolv_conf() {
+  printf '%s/%s/root/etc/resolv.conf\n' "$HOST_PROC" "$1"
+}
+
+backup_resolv_conf() {
+  id="$1"
+  pid="$2"
+  backup="$DNS_STATE_DIR/$id.resolv.original"
+  resolv="$(target_resolv_conf "$pid")"
+
+  [ -r "$backup" ] && return 0
+  [ -r "$resolv" ] || return 1
+  cp "$resolv" "$backup"
+}
+
+write_split_resolv_conf() {
+  id="$1"
+  pid="$2"
+  resolv="$(target_resolv_conf "$pid")"
+  generated="$DNS_STATE_DIR/$id.resolv.conf"
+  original="$DNS_STATE_DIR/$id.resolv.original"
+
+  [ -r "$resolv" ] || return 1
+  backup_resolv_conf "$id" "$pid"
+
+  {
+    printf '%s\n' '# Managed by ovpn-egress. Original resolv.conf is saved in the gateway runtime directory.'
+    awk '/^[[:space:]]*(search|domain)[[:space:]]/ { print }' "$original" 2>/dev/null || true
+    printf 'nameserver %s\n' "$OVPN_DNS_LISTEN"
+    if awk '/^[[:space:]]*options[[:space:]]/ { found = 1 } END { exit found ? 0 : 1 }' "$original" 2>/dev/null; then
+      awk '/^[[:space:]]*options[[:space:]]/ { print; exit }' "$original"
+    else
+      printf '%s\n' 'options ndots:0'
+    fi
+  } >"$generated"
+
+  if cmp -s "$generated" "$resolv" 2>/dev/null; then
+    return 0
+  fi
+
+  cp "$generated" "$resolv"
+}
+
+restore_resolv_conf() {
+  id="$1"
+  backup="$DNS_STATE_DIR/$id.resolv.original"
+
+  [ -r "$backup" ] || return 0
+  pid="$(container_pid "$id" 2>/dev/null || true)"
+  case "$pid" in
+    ''|0|null) return 0 ;;
+  esac
+
+  resolv="$(target_resolv_conf "$pid")"
+  [ -e "$resolv" ] || return 0
+  cp "$backup" "$resolv" || return 1
+  log "restored original resolv.conf for $id"
 }
 
 ensure_split_dns() {
@@ -199,6 +268,10 @@ ensure_split_dns() {
 
   split_dns_enabled || return 0
   mkdir -p "$DNS_STATE_DIR"
+  backup_resolv_conf "$id" "$pid" || {
+    log "failed to back up resolv.conf for $id"
+    return 1
+  }
 
   if ! dns_proxy_running "$id"; then
     pid_file="$(dns_proxy_pid_file "$id")"
@@ -218,7 +291,11 @@ ensure_split_dns() {
     log "started split DNS for $id: domains=$OVPN_DNS_DOMAINS server=$OVPN_DNS_SERVER listen=$OVPN_DNS_LISTEN"
   fi
 
-  install_dns_redirects "$pid"
+  remove_legacy_dns_redirects "$pid"
+  write_split_resolv_conf "$id" "$pid" || {
+    log "failed to install split DNS resolv.conf for $id"
+    return 1
+  }
 }
 
 cleanup_split_dns() {
@@ -239,7 +316,8 @@ cleanup_split_dns() {
       ''|*[!0-9]*) ;;
       *) kill "$dns_pid" 2>/dev/null || true ;;
     esac
-    rm -f "$pid_file" "$DNS_STATE_DIR/$id.log"
+    restore_resolv_conf "$id" || log "failed to restore original resolv.conf for $id"
+    rm -f "$pid_file" "$DNS_STATE_DIR/$id.log" "$DNS_STATE_DIR/$id.resolv.conf" "$DNS_STATE_DIR/$id.resolv.original"
     log "stopped split DNS for stale container $id"
   done
 }

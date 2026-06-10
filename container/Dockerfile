@@ -24,9 +24,7 @@ COPY dns-proxy.sh /usr/local/bin/ovpn-dns-proxy
 COPY healthcheck.sh /usr/local/bin/ovpn-healthcheck
 COPY openvpn-notify openvpn-auth-unlock /usr/local/sbin/
 
-RUN addgroup -S -g 53453 ovpn-dns \
-    && adduser -S -D -H -u 53453 -G ovpn-dns ovpn-dns \
-    && chmod 755 \
+RUN chmod 755 \
     /usr/local/bin/ovpn-entrypoint \
     /usr/local/bin/ovpn-gateway \
     /usr/local/bin/ovpn-controller \
