@@ -200,10 +200,16 @@ route_container() {
     ''|0|null) return 0 ;;
   esac
 
-  if [ ! -e "$HOST_PROC/$pid/ns/net" ]; then
+  netns="$HOST_PROC/$pid/ns/net"
+  if [ ! -L "$netns" ] && [ ! -e "$netns" ]; then
     log "skip $id: netns not found for pid $pid"
     return 0
   fi
+
+  nsenter_error="$(nsenter_net "$pid" true 2>&1)" || {
+    log "skip $id: cannot enter netns for pid $pid: $nsenter_error"
+    return 0
+  }
 
   iface="$(target_iface_for_ip "$pid" "$target_ip")"
   [ -n "$iface" ] || {
